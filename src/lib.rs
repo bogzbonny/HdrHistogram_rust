@@ -850,6 +850,14 @@ impl<T: Counter> Histogram<T> {
         self.record_n(value, T::one())
     }
 
+    /// Unrecord `value` in the histogram, removing from the value's current count.
+    ///
+    /// Returns an error if `value` exceeds the highest trackable value and auto-resize is
+    /// disabled.
+    pub fn unrecord(&mut self, value: u64) -> Result<(), RecordError> {
+        self.record_n_inner(true, value, T::one(), false)
+    }
+
     /// Record `value` in the histogram, clamped to the range of the histogram.
     ///
     /// This method cannot fail, as any values that are too small or too large to be tracked will
@@ -860,13 +868,32 @@ impl<T: Counter> Histogram<T> {
         self.saturating_record_n(value, T::one())
     }
 
+    /// Unrecord `value` in the histogram, removing from the value's current count.
+    ///
+    /// This method cannot fail, as any values that are too small or too large to be tracked will
+    /// automatically be clamed to be in range. Be aware that this *will* hide extreme outliers
+    /// from the resulting histogram without warning. Since the values are clamped, the histogram
+    /// will also not be resized to accomodate the value, even if auto-resize is enabled.
+    pub fn saturating_unrecord(&mut self, value: u64) {
+        self.saturating_record_n(value, T::one())
+    }
+
     /// Record multiple samples for a value in the histogram, adding to the value's current count.
     ///
     /// `count` is the number of occurrences of this value to record.
     ///
     /// Returns an error if `value` cannot be recorded; see `RecordError`.
     pub fn record_n(&mut self, value: u64, count: T) -> Result<(), RecordError> {
-        self.record_n_inner(value, count, false)
+        self.record_n_inner(false, value, count, false)
+    }
+
+    /// Unrecord multiple samples for a value in the histogram, removing from the value's current count.
+    ///
+    /// `count` is the number of occurrences of this value to record.
+    ///
+    /// Returns an error if `value` cannot be unrecorded; see `RecordError`.
+    pub fn unrecord_n(&mut self, value: u64, count: T) -> Result<(), RecordError> {
+        self.record_n_inner(true, value, count, false)
     }
 
     /// Record multiple samples for a value in the histogram, each one clamped to the histogram's
@@ -879,12 +906,34 @@ impl<T: Counter> Histogram<T> {
     /// from the resulting histogram without warning. Since the values are clamped, the histogram
     /// will also not be resized to accomodate the value, even if auto-resize is enabled.
     pub fn saturating_record_n(&mut self, value: u64, count: T) {
-        self.record_n_inner(value, count, true).unwrap()
+        self.record_n_inner(false, value, count, true).unwrap()
     }
 
-    fn record_n_inner(&mut self, mut value: u64, count: T, clamp: bool) -> Result<(), RecordError> {
+    /// Unrecord multiple samples for a value in the histogram, removing from the value's current count.
+    ///
+    /// `count` is the number of occurrences of this value to record.
+    ///
+    /// This method cannot fail, as values that are too small or too large to be recorded will
+    /// automatically be clamed to be in range. Be aware that this *will* hide extreme outliers
+    /// from the resulting histogram without warning. Since the values are clamped, the histogram
+    /// will also not be resized to accomodate the value, even if auto-resize is enabled.
+    pub fn saturating_unrecord_n(&mut self, value: u64, count: T) {
+        self.record_n_inner(true, value, count, true).unwrap()
+    }
+
+    fn record_n_inner(
+        &mut self,
+        sub: bool,
+        mut value: u64,
+        count: T,
+        clamp: bool,
+    ) -> Result<(), RecordError> {
         let recorded_without_resize = if let Some(c) = self.mut_at(value) {
-            *c = (*c).saturating_add(count);
+            if sub {
+                *c = c.saturating_sub(count);
+            } else {
+                *c = c.saturating_add(count);
+            }
             true
         } else {
             false
@@ -903,7 +952,12 @@ impl<T: Counter> Histogram<T> {
                 let c = self
                     .mut_at(value)
                     .expect("unwrap must succeed since low and high are always representable");
-                *c = c.saturating_add(count);
+
+                if sub {
+                    *c = c.saturating_sub(count);
+                } else {
+                    *c = c.saturating_add(count);
+                }
             } else if !self.auto_resize {
                 return Err(RecordError::ValueOutOfRangeResizeDisabled);
             } else {
@@ -916,15 +970,21 @@ impl<T: Counter> Histogram<T> {
                 {
                     let c = self.mut_at(value).expect("value should fit after resize");
                     // after resize, should be no possibility of overflow because this is a new slot
-                    *c = (*c)
-                        .checked_add(&count)
-                        .expect("count overflow after resize");
+                    if sub {
+                        *c = c.checked_sub(&count).expect("count overflow after resize");
+                    } else {
+                        *c = c.checked_add(&count).expect("count overflow after resize");
+                    }
                 }
             }
         }
 
         self.update_min_max(value);
-        self.total_count = self.total_count.saturating_add(count.as_u64());
+        if sub {
+            self.total_count = self.total_count.saturating_sub(count.as_u64());
+        } else {
+            self.total_count = self.total_count.saturating_add(count.as_u64());
+        }
         Ok(())
     }
 
@@ -963,7 +1023,7 @@ impl<T: Counter> Histogram<T> {
             // only enter loop when calculations will stay non-negative
             let mut missing_value = value - interval;
             while missing_value >= interval {
-                self.record_n_inner(missing_value, count, false)?;
+                self.record_n_inner(false, missing_value, count, false)?;
                 missing_value -= interval;
             }
         }
@@ -1705,11 +1765,7 @@ impl<T: Counter> Histogram<T> {
 
     fn reset_min(&mut self, min: u64) {
         let internal_value = min & !self.unit_magnitude_mask; // Min unit-equivalent value
-        self.min_non_zero_value = if min == u64::MAX {
-            min
-        } else {
-            internal_value
-        };
+        self.min_non_zero_value = if min == u64::MAX { min } else { internal_value };
     }
 
     /// Recalculate min, max, total_count.
